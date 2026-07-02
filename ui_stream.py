@@ -4,6 +4,7 @@ import threading
 import io
 import os
 import json
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -12,6 +13,13 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 from PIL import Image
 import pyray as rl
+
+try:
+    import websockets
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+    websockets = None
 
 
 class StreamState:
@@ -32,6 +40,55 @@ class StreamState:
     def wait(self, t=2.0):
         self.event.wait(t)
         self.event.clear()
+
+
+class InputHandler:
+    """Handles input events from WebSocket clients."""
+    def __init__(self):
+        self.device_path = None
+        self._init_device()
+
+    def _init_device(self):
+        """Discover and initialize the touch device."""
+        if not HAS_WEBSOCKETS:
+            return
+        try:
+            import input_injector
+            self.device_path = input_injector.get_touch_device()
+            if self.device_path:
+                print(f"[ui_stream] Touch device: {self.device_path}")
+            else:
+                print("[ui_stream] Warning: No touch device found")
+        except ImportError:
+            print("[ui_stream] input_injector module not found")
+
+    async def handle_event(self, event_json):
+        """Process an input event from the browser."""
+        try:
+            event = json.loads(event_json)
+            if not self.device_path:
+                return
+
+            import input_injector
+
+            action = event.get("action")
+            x = event.get("x", 0)
+            y = event.get("y", 0)
+            pressure = event.get("pressure", 100)
+
+            # Normalize coordinates if needed (browser sends percentages or pixels)
+            if event.get("normalized"):
+                # Scale to typical 1280x720 or actual device resolution
+                width = event.get("width", 1280)
+                height = event.get("height", 720)
+                x = int(x * width / 100)
+                y = int(y * height / 100)
+
+            input_injector.inject_touch_event(
+                self.device_path, x, y, pressure, action
+            )
+        except Exception as e:
+            print(f"[ui_stream] Input error: {e}")
 
 
 _OVERLAY_HTML = """<!DOCTYPE html><html><head>
@@ -141,6 +198,83 @@ body{background:#000;overflow:hidden;height:100vh;width:100vw;margin:0;font-fami
 </div>
 <script>
 let lastData = null;
+let ws = null;
+let wsReconnectTimer = null;
+
+// WebSocket input support
+function connectWebSocket() {
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsPort = parseInt(window.location.port) + 1;
+  const wsUrl = proto + '://' + window.location.hostname + ':' + wsPort;
+
+  try {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      console.log('[ws] Connected');
+    };
+    ws.onerror = (e) => {
+      console.log('[ws] Error:', e);
+    };
+    ws.onclose = () => {
+      console.log('[ws] Closed, retrying in 2s...');
+      wsReconnectTimer = setTimeout(connectWebSocket, 2000);
+    };
+  } catch (e) {
+    console.log('[ws] Failed:', e);
+    wsReconnectTimer = setTimeout(connectWebSocket, 2000);
+  }
+}
+
+function sendInput(action, x, y, pressure = 100) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const cam = document.getElementById('cam');
+  const rect = cam.getBoundingClientRect();
+  const imgX = x - rect.left;
+  const imgY = y - rect.top;
+  const normX = (imgX / rect.width) * 100;
+  const normY = (imgY / rect.height) * 100;
+
+  ws.send(JSON.stringify({
+    action: action,
+    x: normX,
+    y: normY,
+    pressure: pressure,
+    normalized: true,
+    width: 1280,
+    height: 720,
+  }));
+}
+
+// Touch/click handlers
+document.addEventListener('touchstart', (e) => {
+  const touch = e.touches[0];
+  sendInput('down', touch.clientX, touch.clientY);
+}, {passive: false});
+
+document.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  const touch = e.touches[0];
+  sendInput('move', touch.clientX, touch.clientY);
+}, {passive: false});
+
+document.addEventListener('touchend', (e) => {
+  sendInput('up', e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+}, {passive: false});
+
+document.addEventListener('mousedown', (e) => {
+  if (e.target.id === 'cam') sendInput('down', e.clientX, e.clientY);
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (e.buttons === 1 && e.target.id === 'cam') {
+    sendInput('move', e.clientX, e.clientY);
+  }
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (e.target.id === 'cam') sendInput('up', e.clientX, e.clientY);
+});
+
 function poll() {
   fetch('/telemetry').then(r => r.json()).then(d => {
     lastData = d;
@@ -173,11 +307,11 @@ function poll() {
     }
 
     // Steer
-    
+
 
     // Grade
-    
-    
+
+
 
     // Accel
     const a = d.aEgo || 0;
@@ -206,6 +340,7 @@ function poll() {
 document.addEventListener("DOMContentLoaded",function(){
   setTimeout(function(){window.scrollTo(0,1);},100);
   setTimeout(function(){window.scrollTo(0,0);},200);
+  connectWebSocket();
 });
 function toggleFS(){var d=document.documentElement;try{if(!document.fullscreenElement&&!document.webkitFullscreenElement){if(d.requestFullscreen)d.requestFullscreen();else if(d.webkitRequestFullscreen)d.webkitRequestFullscreen(Element.ALLOW_KEYBOARD_INPUT);else if(d.webkitEnterFullscreen)d.webkitEnterFullscreen();else alert('Fullscreen not supported');}else{if(document.exitFullscreen)document.exitFullscreen();else if(document.webkitExitFullscreen)document.webkitExitFullscreen();}}catch(e){alert('FS error: '+e);}}
 poll();
@@ -274,18 +409,69 @@ class StreamHandler(BaseHTTPRequestHandler):
         pass
 
 
+async def websocket_handler(websocket, path, input_handler):
+    """Handle WebSocket connections from the browser."""
+    try:
+        async for message in websocket:
+            await input_handler.handle_event(message)
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    except Exception as e:
+        print(f"[ui_stream] WebSocket error: {e}")
+
+
+def run_websocket_server(port, input_handler):
+    """Run the WebSocket server in its own asyncio loop."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def start():
+        async with websockets.serve(
+            lambda ws, path: websocket_handler(ws, path, input_handler),
+            "0.0.0.0",
+            port,
+        ):
+            await asyncio.Future()  # run forever
+
+    try:
+        loop.run_until_complete(start())
+    except Exception as e:
+        print(f"[ui_stream] WebSocket server error: {e}")
+
+
 _state = None
+_input_handler = None
 _counter = 0
 
 
-def start(port=8082):
-    """Start the MJPEG HTTP server in a background thread."""
-    global _state
+def start(port=8082, ws_port=None):
+    """Start the MJPEG HTTP server and optional WebSocket server.
+
+    Args:
+        port: HTTP server port (default 8082)
+        ws_port: WebSocket server port (default port+1, or disabled if False)
+    """
+    global _state, _input_handler
+
     _state = StreamState()
     srv = ThreadingHTTPServer(("0.0.0.0", port), StreamHandler)
     srv._state = _state
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
+
+    # Start WebSocket server if available
+    if HAS_WEBSOCKETS and ws_port is not False:
+        if ws_port is None:
+            ws_port = port + 1
+        _input_handler = InputHandler()
+        ws_thread = threading.Thread(
+            target=run_websocket_server,
+            args=(ws_port, _input_handler),
+            daemon=True,
+        )
+        ws_thread.start()
+        print(f"[ui_stream] WebSocket server on port {ws_port}")
+
     return _state
 
 
